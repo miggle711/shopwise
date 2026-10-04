@@ -57,19 +57,21 @@ For product search, Elasticsearch runs a search that combines keyword matching a
 ```mermaid
 flowchart TD
     S([START]) --> CI[classify_intent]
-    CI -->|product_details| PN[product_node]
+    CI -->|product_details| PA[product_agent_node]
     CI -->|small_talk| ST[small_talk_node]
     CI -->|sensitive_topic| SN[sensitive_node]
     CI -->|clarify| CN[clarify_node]
 
-    PN --> PR[Existing product runtime<br/>Gemini + tools]
-    PR --> E([END])
+    PA -->|model requested a tool call| PT[product_tools_node]
+    PT --> PA
+    PA -->|no tool call, or MAX_TOOL_ITERATIONS reached| PF[product_finalize_node]
+    PF --> E([END])
     ST --> E
     SN --> E
     CN --> E
 ```
 
-The current graph is intentionally simple: LangGraph owns intent classification and branching, while the `product_details` branch still delegates to the existing product tool-calling runtime in `backend/app/agent.py`.
+LangGraph owns the whole conversation, including the product tool-calling loop. `product_agent_node` calls the Gemini model with tools bound; if it requests a tool call, `product_tools_node` executes it and loops back to `product_agent_node`, up to `MAX_TOOL_ITERATIONS`. `product_finalize_node` applies a fallback message if the loop ends with no text response. This replaced an earlier version where `product_details` delegated to a hand-rolled tool-calling loop in `backend/app/agent.py`; that loop is now expressed natively as graph nodes and a conditional edge, so the whole conversation — not just intent routing — lives in one LangGraph graph.
 
 ### Search pipeline (`backend/search.py`, `backend/cache.py`)
 
@@ -278,8 +280,8 @@ Used to manage the catalog directly, separate from chat-based search.
 
 - Guests and signed-in users are both stored as `User` rows in Postgres. A guest gets a "shadow" user created automatically the first time they act (add to cart, etc). Signing up or logging in just gives a request a JWT token that resolves to a real `User` row instead. See `backend/session_identity.py`'s `resolve_user`.
 - Conversations are stored in Redis with a TTL (`conversation_ttl_seconds`, default 24h). They survive backend restarts but expire eventually, not "forever." Long-term preferences for signed-in users are stored separately in Postgres and do not expire.
-- The product branch is intentionally transitional: LangGraph owns routing, but `product_details` still delegates to the existing tool-calling runtime in `backend/app/agent.py`.
-- The system prompt for product requests is hardcoded in `backend/app/agent.py`; it is not currently configurable per-request.
+- The product tool-calling loop (`product_agent_node` / `product_tools_node` / `product_finalize_node` in `backend/app/graph.py`) is fully native LangGraph: the model call, tool dispatch, and the loop back to the model all live as graph nodes and a conditional edge, up to `MAX_TOOL_ITERATIONS`. `backend/app/agent.py` now only holds the summarization LLM and the shared Langfuse client.
+- The system prompt for product requests is hardcoded in `backend/app/graph.py`; it is not currently configurable per-request.
 - `small_talk`, `sensitive_topic`, and `clarify` are currently lightweight graph-native branches and should be refined before treating them as production-quality conversational flows.
 - Elasticsearch and Redis indices are created automatically on backend startup if they don't already exist (`init_es_index`, `init_cache_index`), inside an async FastAPI `lifespan` handler. ES/Redis are a _soft_ dependency at boot: if either is unreachable, startup retries a few times, then logs a warning and continues rather than crashing the whole API (#52) — `GET /health` reports the live status either way.
 - Langfuse tracing now uses explicit request-level spans in `chat.py`, plus child spans from `graph.py`, so every request produces a visible trace even when no product tools are called.
