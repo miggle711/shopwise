@@ -3,7 +3,7 @@ import os
 from unittest.mock import AsyncMock
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 # Placeholder-string matching (e.g. checking for "test-key") is brittle —
 # CI uses a different placeholder ("dummy-key-for-tests") than local dev's
@@ -95,35 +95,124 @@ def test_graph_compiles():
     assert graph.chat_graph is not None
 
 
-async def test_product_node_uses_product_agent(mocker):
+async def test_product_agent_node_returns_text_response_when_no_tool_calls(mocker):
     import app.graph as graph
 
-    mock_invoke = mocker.patch.object(
-        graph,
-        "_invoke_product_agent",
-        AsyncMock(return_value={"output": "Here are three laptop options under $900."}),
-    )
+    ai_message = AIMessage(content="Here are three laptop options under $900.")
+    ai_message.tool_calls = []
+    mock_llm = mocker.Mock()
+    mock_llm.ainvoke = AsyncMock(return_value=ai_message)
+    mocker.patch.object(graph, "_tool_enabled_product_llm", mock_llm)
 
     state = {
         "input": "Show me laptops under $900",
         "chat_history": [HumanMessage(content="I need something for school.")],
     }
 
-    assert (await graph.product_node(state)) == {
-        "response": "Here are three laptop options under $900.",
-        "tool_calls": [],
-    }
-    mock_invoke.assert_called_once_with(state, config=None)
+    result = await graph.product_agent_node(state)
+
+    assert result["response"] == "Here are three laptop options under $900."
+    assert result["product_iterations"] == 1
+    assert graph.route_from_product_agent({**state, **result}) == "product_finalize_node"
 
 
-async def test_product_node_falls_back_when_agent_returns_no_output(mocker):
+async def test_product_agent_node_routes_to_tools_node_when_model_calls_a_tool(mocker):
     import app.graph as graph
 
-    mocker.patch.object(graph, "_invoke_product_agent", AsyncMock(return_value={}))
+    ai_message = AIMessage(content="")
+    ai_message.tool_calls = [{"name": "semantic_search", "args": {"query": "laptop"}, "id": "call_1"}]
+    mock_llm = mocker.Mock()
+    mock_llm.ainvoke = AsyncMock(return_value=ai_message)
+    mocker.patch.object(graph, "_tool_enabled_product_llm", mock_llm)
 
-    assert (await graph.product_node({"input": "Find a coffee grinder"})) == {
-        "response": "I apologize, but I'm having trouble generating a response at the moment.",
+    state = {"input": "Show me laptops under $900", "chat_history": []}
+    result = await graph.product_agent_node(state)
+
+    assert graph.route_from_product_agent({**state, **result}) == "product_tools_node"
+
+
+async def test_route_from_product_agent_stops_looping_at_max_iterations(mocker):
+    import app.graph as graph
+
+    tool_call_message = AIMessage(content="")
+    tool_call_message.tool_calls = [{"name": "semantic_search", "args": {}, "id": "call_1"}]
+
+    state = {
+        "product_messages": [tool_call_message],
+        "product_iterations": graph.MAX_TOOL_ITERATIONS,
+    }
+
+    assert graph.route_from_product_agent(state) == "product_finalize_node"
+
+
+async def test_product_tools_node_invokes_matching_tool_and_logs_call(mocker):
+    import app.graph as graph
+
+    mock_tool = mocker.Mock(spec=["ainvoke"])
+    mock_tool.ainvoke = AsyncMock(return_value="3 laptops found")
+    mocker.patch.object(graph, "_product_tool_map", {"semantic_search": mock_tool})
+
+    ai_message = AIMessage(content="")
+    ai_message.tool_calls = [{"name": "semantic_search", "args": {"query": "laptop"}, "id": "call_1"}]
+
+    state = {"product_messages": [ai_message], "tool_calls": []}
+    result = await graph.product_tools_node(state)
+
+    mock_tool.ainvoke.assert_called_once_with({"query": "laptop"}, config=None)
+    assert result["tool_calls"] == [
+        {"tool": "semantic_search", "args": {"query": "laptop"}, "result": "3 laptops found"}
+    ]
+    assert isinstance(result["product_messages"][-1], ToolMessage)
+    assert result["product_messages"][-1].content == "3 laptops found"
+
+
+async def test_product_tools_node_injects_session_id_for_marked_tools(mocker):
+    import app.graph as graph
+
+    mock_tool = mocker.Mock()
+    mock_tool._needs_session_id = True
+    mock_tool.ainvoke = AsyncMock(return_value="Cart updated")
+    mocker.patch.object(graph, "_product_tool_map", {"add_to_cart": mock_tool})
+
+    ai_message = AIMessage(content="")
+    ai_message.tool_calls = [{"name": "add_to_cart", "args": {"product_id": "p1"}, "id": "call_1"}]
+
+    state = {
+        "product_messages": [ai_message],
         "tool_calls": [],
+        "session_id": "session-123",
+    }
+    await graph.product_tools_node(state)
+
+    mock_tool.ainvoke.assert_called_once_with(
+        {"product_id": "p1", "session_id": "session-123"}, config=None
+    )
+
+
+async def test_product_tools_node_handles_unknown_tool_name(mocker):
+    import app.graph as graph
+
+    mocker.patch.object(graph, "_product_tool_map", {})
+
+    ai_message = AIMessage(content="")
+    ai_message.tool_calls = [{"name": "not_a_real_tool", "args": {}, "id": "call_1"}]
+
+    result = await graph.product_tools_node({"product_messages": [ai_message], "tool_calls": []})
+
+    assert "not available" in result["tool_calls"][0]["result"]
+
+
+def test_product_finalize_node_keeps_existing_response():
+    import app.graph as graph
+
+    assert graph.product_finalize_node({"response": "Here are some laptops."}) == {}
+
+
+def test_product_finalize_node_falls_back_when_no_response():
+    import app.graph as graph
+
+    assert graph.product_finalize_node({"response": ""}) == {
+        "response": "I apologize, but I'm having trouble generating a response at the moment."
     }
 
 # Tests live LLM classification (requires a real GOOGLE_API_KEY)
