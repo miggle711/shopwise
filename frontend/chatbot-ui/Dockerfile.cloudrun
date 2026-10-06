@@ -1,0 +1,39 @@
+# Cloud Run variant of the frontend image. Local development still uses
+# Dockerfile + nginx.conf (docker-compose.yml, backend reachable by the
+# Docker Compose service name "backend"). Cloud Run has no such DNS name
+# and injects PORT at runtime instead of a fixed port 80, so this builds
+# the same Angular app but serves it from an nginx config rendered from
+# nginx.cloudrun.conf.template at container start.
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN corepack enable && npm ci --legacy-peer-deps
+
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+
+COPY --from=builder /app/dist/chatbot-ui/browser /usr/share/nginx/html
+
+COPY nginx.cloudrun.conf.template /etc/nginx/nginx.conf.template
+
+ENV PORT=8080
+# Overridden at deploy time with the real backend Cloud Run URL and its
+# bare hostname (Cloud Run's ingress routes by Host header, so the
+# proxied request must carry the backend's own host, not the frontend's).
+ENV BACKEND_URL=http://localhost:8000
+ENV BACKEND_HOST=localhost
+
+EXPOSE 8080
+
+# Bypass the base image's own /docker-entrypoint.sh, which auto-renders
+# any /etc/nginx/templates/*.template using an unscoped envsubst — that
+# would also blank out nginx's own $uri/$host/etc. variables, since
+# they aren't real env vars in this container. Rendering explicitly
+# here, with envsubst restricted to just these variables, keeps nginx's
+# own $-prefixed variables intact.
+ENTRYPOINT []
+CMD ["sh", "-c", "envsubst '$PORT $BACKEND_URL $BACKEND_HOST' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]
